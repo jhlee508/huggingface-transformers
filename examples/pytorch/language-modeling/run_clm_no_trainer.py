@@ -35,7 +35,7 @@ import datasets
 import torch
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, MegatronLMDummyScheduler
 from datasets import load_dataset
 from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
@@ -498,12 +498,21 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    )
+    # New Code
+    # For Megatron-LM, we need to use `MegatronLMDummyScheduler` instead of regular schedulers
+    if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+        lr_scheduler = MegatronLMDummyScheduler(
+            optimizer=optimizer,
+            total_num_steps=args.max_train_steps,
+            warmup_num_steps=args.num_warmup_steps,
+        )
+    else:
+        lr_scheduler = get_scheduler(
+            name=args.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=args.num_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        )
 
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
@@ -535,7 +544,15 @@ def main():
         accelerator.init_trackers("clm_no_trainer", experiment_config)
 
     # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    # New Code
+    # For Megatron-LM, we need to get `global_batch_size` from megatron_lm_plugin
+    # as it handles the specifics related to data parallelism, tensor model parallelism and pipeline parallelism
+    if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+        total_batch_size = accelerator.state.megatron_lm_plugin.global_batch_size
+    else:
+        total_batch_size = (
+            args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        )
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -619,10 +636,17 @@ def main():
                 outputs = model(**batch)
 
             loss = outputs.loss
-            losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
-
-        losses = torch.cat(losses)
+            # New Code
+            # For Megatron-LM, the losses are already averaged across the data parallel group
+            if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+                losses.append(loss)
+            else:
+                losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
         try:
+            if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+                losses = torch.tensor(losses)
+            else:
+                losses = torch.cat(losses)
             eval_loss = torch.mean(losses)
             perplexity = math.exp(eval_loss)
         except OverflowError:
@@ -665,10 +689,15 @@ def main():
 
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-        )
+        # New Code
+        # For Megatron-LM, we need to save the model using `accelerator.save_state`
+        if accelerator.distributed_type == DistributedType.MEGATRON_LM:
+            accelerator.save_state(args.output_dir)
+        else:
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(
+                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+            )
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
             if args.push_to_hub:
