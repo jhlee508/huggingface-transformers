@@ -1,0 +1,24 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: MEGATRON_LM
+downcast_bf16: 'no'
+machine_rank: 0
+main_process_ip: 192.168.0.130
+main_process_port: 1234
+main_training_function: main
+megatron_lm_config:
+  megatron_lm_gradient_clipping: 1.0
+  megatron_lm_num_micro_batches: 2
+  megatron_lm_pp_degree: 2
+  megatron_lm_recompute_activations: true
+  megatron_lm_sequence_parallelism: true
+  megatron_lm_tp_degree: 4
+  megatron_lm_use_distributed_optimizer: true
+mixed_precision: fp16
+num_machines: 2
+num_processes: 8
+rdzv_backend: c10d
+same_network: false
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
